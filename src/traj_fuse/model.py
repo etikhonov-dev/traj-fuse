@@ -22,7 +22,6 @@ if TYPE_CHECKING:
 
 class SharedPrivateConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-
     d_traj: int = Field(ge=1)
     d_mol: int = Field(ge=1)
     d_shared: int = Field(default=4, ge=1)
@@ -33,10 +32,10 @@ class SharedPrivateConfig(BaseModel):
     dropout: float = Field(default=0.1, ge=0.0, lt=1.0)
     p_mask: float = Field(default=0.20, ge=0.0, lt=1.0)
     p_drop: float = Field(default=0.30, ge=0.0, le=1.0)
-    lambda_vic: float = Field(default=1.0, ge=0.0)
-    lambda_orth: float = Field(default=0.5, ge=0.0)
-    lambda_recon: float = Field(default=1.0, ge=0.0)
-    lambda_drop: float = Field(default=1.0, ge=0.0)
+    lambda_vic: float = Field(default=0.25, ge=0.0)
+    lambda_orth: float = Field(default=0.25, ge=0.0)
+    lambda_recon: float = Field(default=5.0, ge=0.0)
+    lambda_drop: float = Field(default=2.0, ge=0.0)
 
     @property
     def d_fused(self) -> int:
@@ -68,24 +67,17 @@ class SharedPrivateFuse(nn.Module):
     def __init__(self, config: SharedPrivateConfig) -> None:
         super().__init__()
         self.config = config
+        c = config
         self.traj_enc = IrregularTrajectoryEncoder(
-            config.d_traj,
-            config.d_model,
-            config.n_heads,
-            config.n_layers,
-            config.d_shared,
-            config.d_priv,
-            config.dropout,
+            c.d_traj, c.d_model, c.n_heads, c.n_layers, c.d_shared, c.d_priv, c.dropout
         )
-        self.mol_enc = MolecularEncoder(
-            config.d_mol, config.d_model, config.d_shared, config.d_priv, config.dropout
-        )
-        self.b_miss_mol = nn.Parameter(torch.zeros(config.d_priv))
-        d_fused = config.d_fused
-        last = nn.Linear(d_fused, d_fused)
+        self.mol_enc = MolecularEncoder(c.d_mol, c.d_model, c.d_shared, c.d_priv, c.dropout)
+        self.b_miss_mol = nn.Parameter(torch.zeros(c.d_priv))
+        d_f = c.d_fused
+        last = nn.Linear(d_f, d_f)
         nn.init.zeros_(last.weight)
         nn.init.zeros_(last.bias)
-        self.mlp_fuse = nn.Sequential(nn.Linear(d_fused + 1, d_fused), nn.SiLU(), last)
+        self.mlp_fuse = nn.Sequential(nn.Linear(d_f + 1, d_f), nn.SiLU(), last)
 
     def forward(
         self,
@@ -152,30 +144,20 @@ class SSLPretrainModule(nn.Module):
 
     def forward_loss(
         self,
-        traj_values: Tensor,
-        traj_obs_mask: Tensor,
-        visit_deltas: Tensor,
-        landmark_lags: Tensor,
-        visit_mask: Tensor,
+        tv: Tensor,
+        tm: Tensor,
+        vd: Tensor,
+        ll: Tensor,
+        vm: Tensor,
         landmark_time: float,
-        panel_values: Tensor,
-        panel_obs_mask: Tensor,
+        pv: Tensor,
+        pm: Tensor,
         panel_available: Tensor,
         *,
         generator: torch.Generator,
     ) -> tuple[Tensor, dict[str, float]]:
-        cfg, m_obs = self.config, panel_available.to(traj_values.dtype)
-        clean = self.fuse(
-            traj_values,
-            traj_obs_mask,
-            visit_deltas,
-            landmark_lags,
-            visit_mask,
-            landmark_time,
-            panel_values,
-            panel_obs_mask,
-            m_obs,
-        )
+        cfg, m_obs = self.config, panel_available.to(tv.dtype)
+        clean = self.fuse(tv, tm, vd, ll, vm, landmark_time, pv, pm, m_obs)
         n_p = int(panel_available.sum().item())
         l_vic = _vicreg_var_cov(clean.z_traj_shared) + _vicreg_var_cov(clean.z_traj_priv)
         if n_p >= 1:
@@ -198,42 +180,44 @@ class SSLPretrainModule(nn.Module):
                 + _cross_orth(clean.z_traj_priv[panel_available], clean.z_mol_priv[panel_available])
             )
 
-        obs_t = (traj_obs_mask > 0.5) & visit_mask.unsqueeze(-1)
-        drop_t = _sample_coord_mask(obs_t, cfg.p_mask, generator)
-        obs_p = panel_obs_mask > 0.5
-        drop_p = _sample_coord_mask(obs_p, cfg.p_mask, generator)
+        obs_t, obs_p = (tm > 0.5) & vm.unsqueeze(-1), pm > 0.5
+        drop_t, drop_p = (
+            _sample_coord_mask(obs_t, cfg.p_mask, generator),
+            _sample_coord_mask(obs_p, cfg.p_mask, generator),
+        )
         m_drop = m_obs * (
             torch.rand(m_obs.shape, generator=generator, device=m_obs.device) >= cfg.p_drop
         ).to(m_obs.dtype)
         corrupt = self.fuse(
-            traj_values.masked_fill(drop_t, 0.0),
-            traj_obs_mask.masked_fill(drop_t, 0.0),
-            visit_deltas,
-            landmark_lags,
-            visit_mask,
+            tv.masked_fill(drop_t, 0.0),
+            tm.masked_fill(drop_t, 0.0),
+            vd,
+            ll,
+            vm,
             landmark_time,
-            panel_values.masked_fill(drop_p, 0.0) * m_drop.unsqueeze(-1),
-            panel_obs_mask.masked_fill(drop_p, 0.0) * m_drop.unsqueeze(-1),
+            pv.masked_fill(drop_p, 0.0) * m_drop.unsqueeze(-1),
+            pm.masked_fill(drop_p, 0.0) * m_drop.unsqueeze(-1),
             m_drop,
         )
-        l_recon = traj_values.new_tensor(0.0)
+        l_recon = tv.new_tensor(0.0)
         if drop_t.any():
             b_idx, l_idx = torch.nonzero(drop_t.any(dim=-1), as_tuple=True)
-            tau = compute_dimensionless_time(visit_deltas, landmark_lags, landmark_time)
-            dec_in = torch.cat([corrupt.z_fused[b_idx], self.dec_t2v(tau[b_idx, l_idx])], dim=-1)
-            pred_t: Tensor = self.traj_dec(dec_in)
+            tau = compute_dimensionless_time(vd, ll, landmark_time)
+            pred_t: Tensor = self.traj_dec(
+                torch.cat([corrupt.z_fused[b_idx], self.dec_t2v(tau[b_idx, l_idx])], dim=-1)
+            )
             l_recon = l_recon + fn.mse_loss(
-                pred_t[drop_t[b_idx, l_idx]], traj_values[b_idx, l_idx][drop_t[b_idx, l_idx]]
+                pred_t[drop_t[b_idx, l_idx]], tv[b_idx, l_idx][drop_t[b_idx, l_idx]]
             )
         pred_p: Tensor = self.panel_dec(corrupt.z_fused)
         dropped_p = panel_available & (~m_drop.bool())
         recon_p = torch.where(m_drop.bool().unsqueeze(-1), drop_p, dropped_p.unsqueeze(-1) & obs_p)
         if recon_p.any():
-            l_recon = l_recon + fn.mse_loss(pred_p[recon_p], panel_values[recon_p])
+            l_recon = l_recon + fn.mse_loss(pred_p[recon_p], pv[recon_p])
         l_drop = (
             fn.mse_loss(corrupt.z_fused[dropped_p], clean.z_fused[dropped_p].detach())
             if dropped_p.any()
-            else traj_values.new_tensor(0.0)
+            else tv.new_tensor(0.0)
         )
         total = (
             cfg.lambda_vic * l_vic

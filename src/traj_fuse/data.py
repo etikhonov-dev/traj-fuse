@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -14,8 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 PBC2_PARQUET_SHA256 = "27f132e9f3b18a5889c2af2b35cdd42602ecc70bc9f0ca575d7c2475879fc8b3"
 DEFAULT_PBC2_PARQUET = Path(__file__).resolve().parents[2] / "data" / "pbc2_longitudinal.parquet"
-
-PBC2_TRAJ_COLS: tuple[str, ...] = (
+PBC2_TRAJ_COLS = (
     "serBilir",
     "albumin",
     "alkaline",
@@ -25,16 +25,9 @@ PBC2_TRAJ_COLS: tuple[str, ...] = (
     "age",
     "sex_female",
 )
-PBC2_LOG_TRAJ_COLS: tuple[str, ...] = ("serBilir", "alkaline", "SGOT", "prothrombin")
-PBC2_RAW_PANEL_COLS: tuple[str, ...] = (
-    "histologic",
-    "serChol",
-    "ascites",
-    "hepatomegaly",
-    "spiders",
-    "edema_score",
-)
-PBC2_PANEL_FEATURE_NAMES: tuple[str, ...] = (
+PBC2_LOG_TRAJ_COLS = ("serBilir", "alkaline", "SGOT", "prothrombin")
+PBC2_RAW_PANEL_COLS = ("histologic", "serChol", "ascites", "hepatomegaly", "spiders", "edema_score")
+PBC2_PANEL_FEATURE_NAMES = (
     "histologic",
     "baseline_serChol",
     "ascites",
@@ -42,13 +35,12 @@ PBC2_PANEL_FEATURE_NAMES: tuple[str, ...] = (
     "spiders",
     "edema_score",
 )
-PBC2_LOG_PANEL_COLS: tuple[str, ...] = ("serChol",)
+PBC2_LOG_PANEL_COLS = ("serChol",)
 OracleTuple = tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]
 
 
 class LandmarkCohortConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-
     landmark_time: float = Field(gt=0.0, description="Hard landmark T_L in years.")
     train_frac: float = Field(default=0.65, gt=0.0, lt=1.0)
     val_frac: float = Field(default=0.15, gt=0.0, lt=1.0)
@@ -130,19 +122,19 @@ class LandmarkedCohortSplits:
 
 
 def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _hash_dataframe(name: str, df: pd.DataFrame) -> str:
-    digest = hashlib.sha256(name.encode("utf-8"))
-    for col in df.columns:
-        digest.update(str(col).encode("utf-8"))
-        digest.update(df[col].to_numpy().tobytes())
-    return digest.hexdigest()
+    h = hashlib.sha256(name.encode("utf-8"))
+    for c in df.columns:
+        h.update(str(c).encode("utf-8"))
+        h.update(df[c].to_numpy().tobytes())
+    return h.hexdigest()
 
 
 def _stratified_split_indices(
@@ -151,10 +143,10 @@ def _stratified_split_indices(
     rng = np.random.default_rng(seed)
     tr, va, te = [], [], []
     for label in (0, 1):
-        cls_idx = np.flatnonzero(events == label).astype(np.int64)
-        if cls_idx.size == 0:
+        idx = np.flatnonzero(events == label).astype(np.int64)
+        if idx.size == 0:
             continue
-        perm = cls_idx[rng.permutation(cls_idx.size)]
+        perm = idx[rng.permutation(idx.size)]
         n_cls = int(perm.size)
         n_tr = max(1, int(round(n_cls * train_frac)))
         n_va = max(1, int(round(n_cls * val_frac))) if n_cls >= 3 else 0
@@ -173,9 +165,9 @@ def _stratified_split_indices(
 def _fit_observed_stats(
     values: NDArray[np.float64],
 ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    n_cols = values.shape[1]
-    means, stds = np.zeros(n_cols, dtype=np.float32), np.ones(n_cols, dtype=np.float32)
-    for col in range(n_cols):
+    n_c = values.shape[1]
+    means, stds = np.zeros(n_c, dtype=np.float32), np.ones(n_c, dtype=np.float32)
+    for col in range(n_c):
         valid = values[~np.isnan(values[:, col]), col]
         if valid.size > 0:
             means[col] = np.float32(valid.mean())
@@ -193,6 +185,83 @@ def _apply_log1p(
     return sub.to_numpy(dtype=np.float64)
 
 
+def _pack_split(
+    sp_pids: tuple[str, ...],
+    row_pids: NDArray[Any],
+    row_times: NDArray[np.float64],
+    traj_mat: NDArray[np.float64],
+    traj_mean: NDArray[np.float32],
+    traj_std: NDArray[np.float32],
+    panel_mat: NDArray[np.float64],
+    panel_mean: NDArray[np.float32],
+    panel_std: NDArray[np.float32],
+    followup_time: NDArray[np.float64],
+    event: NDArray[np.int64],
+    pid_to_pos: dict[str, int],
+    t_land: float,
+    gt_by_id: dict[str, OracleTuple] | None,
+) -> LandmarkedSplit:
+    n_sp, lmap = len(sp_pids), {pid: i for i, pid in enumerate(sp_pids)}
+    keep = np.fromiter((p in lmap for p in row_pids), dtype=np.bool_, count=len(row_pids))
+    p_idx = np.fromiter(
+        (lmap[str(p)] for p in row_pids[keep]), dtype=np.int64, count=int(keep.sum())
+    )
+    counts = np.bincount(p_idx, minlength=n_sp)
+    l_max = int(counts.max())
+    offsets = np.zeros(n_sp, dtype=np.int64)
+    if n_sp > 1:
+        offsets[1:] = np.cumsum(counts[:-1])
+    order = np.argsort(p_idx, kind="mergesort")
+    p_idx, s_times, s_traj = p_idx[order], row_times[keep][order], traj_mat[keep][order]
+    step = np.arange(len(p_idx), dtype=np.int64) - offsets[p_idx]
+
+    d_t = traj_mat.shape[1]
+    t_vals, t_mask = (
+        np.zeros((n_sp, l_max, d_t), np.float32),
+        np.zeros((n_sp, l_max, d_t), np.float32),
+    )
+    vt, vd, vl = (np.zeros((n_sp, l_max), np.float32) for _ in range(3))
+    vm = np.zeros((n_sp, l_max), np.bool_)
+    obs_t = ~np.isnan(s_traj)
+    t_vals[p_idx, step, :] = np.where(obs_t, (s_traj - traj_mean) / traj_std, 0.0).astype(
+        np.float32
+    )
+    t_mask[p_idx, step, :] = obs_t.astype(np.float32)
+    vt[p_idx, step], vl[p_idx, step] = (
+        s_times.astype(np.float32),
+        (t_land - s_times).astype(np.float32),
+    )
+    vm[p_idx, step] = True
+    if l_max > 1:
+        vd[:, 1:] = np.where(vm[:, 1:], np.maximum(vt[:, 1:] - vt[:, :-1], 0.0), 0.0)
+
+    g_idx = np.fromiter((pid_to_pos[p] for p in sp_pids), dtype=np.int64, count=n_sp)
+    raw_p = panel_mat[g_idx]
+    obs_p = ~np.isnan(raw_p)
+    p_vals = np.where(obs_p, (raw_p - panel_mean) / panel_std, 0.0).astype(np.float32)
+    gt: GroundTruthSubspaces | None = None
+    if gt_by_id is not None:
+        gt = GroundTruthSubspaces(
+            *(np.vstack([gt_by_id[p][k] for p in sp_pids]).astype(np.float32) for k in range(3))
+        )
+    ssl = SSLPretrainSplit(
+        sp_pids,
+        t_land,
+        t_vals,
+        t_mask,
+        vt,
+        vd,
+        vl,
+        vm,
+        p_vals,
+        obs_p.astype(np.float32),
+        obs_p.any(axis=1),
+    )
+    return LandmarkedSplit(
+        ssl, (followup_time[g_idx] - t_land).astype(np.float64), event[g_idx].astype(np.int64), gt
+    )
+
+
 def build_landmarked_splits(
     raw: RawLongitudinalCohort, config: LandmarkCohortConfig
 ) -> LandmarkedCohortSplits:
@@ -202,107 +271,51 @@ def build_landmarked_splits(
         raise ValueError("All visit_time values must be >= 0.0.")
     if df.duplicated(subset=["patient_id", "visit_time"]).any():
         raise ValueError("Duplicate (patient_id, visit_time) visits detected.")
-    eligible_df = df[df["followup_time"] > config.landmark_time]
-    if eligible_df.empty:
+    eligible = df[df["followup_time"] > config.landmark_time]
+    if eligible.empty:
         raise ValueError(f"No patients survive past landmark_time={config.landmark_time}.")
-    pre_df = eligible_df[eligible_df["visit_time"] <= config.landmark_time]
-    if set(eligible_df["patient_id"].unique()) != set(pre_df["patient_id"].unique()):
+    pre = eligible[eligible["visit_time"] <= config.landmark_time]
+    if set(eligible["patient_id"].unique()) != set(pre["patient_id"].unique()):
         raise ValueError("Every eligible patient must have >= 1 visit at or before landmark_time.")
 
-    enroll_df = pre_df.drop_duplicates(subset=["patient_id"], keep="first").reset_index(drop=True)
-    if (enroll_df["visit_time"] > 0.05).any():
+    enroll = pre.drop_duplicates(subset=["patient_id"], keep="first").reset_index(drop=True)
+    if (enroll["visit_time"] > 0.05).any():
         raise ValueError("Every patient must have an enrollment visit at t <= 0.05 years.")
-    patient_ids = tuple(str(pid) for pid in enroll_df["patient_id"].tolist())
-    pid_to_pos = {pid: idx for idx, pid in enumerate(patient_ids)}
-    followup_time = enroll_df["followup_time"].to_numpy(dtype=np.float64)
-    event = enroll_df["event"].to_numpy(dtype=np.int64)
-    if not np.isin(event, (0, 1)).all():
+    pids = tuple(str(p) for p in enroll["patient_id"].tolist())
+    pid_to_pos = {p: i for i, p in enumerate(pids)}
+    fu, ev = enroll["followup_time"].to_numpy(np.float64), enroll["event"].to_numpy(np.int64)
+    if not np.isin(ev, (0, 1)).all():
         raise ValueError("Event values must be strictly in {0, 1}.")
 
-    idx_splits = _stratified_split_indices(event, config.train_frac, config.val_frac, config.seed)
-    split_pids = tuple(tuple(patient_ids[i] for i in idx) for idx in idx_splits)
-    traj_mat = _apply_log1p(pre_df, raw.traj_cols, raw.log_transform_traj_cols)
-    panel_mat = _apply_log1p(enroll_df, raw.panel_cols, raw.log_transform_panel_cols)
-    tr_visit = pre_df["patient_id"].isin(set(split_pids[0])).to_numpy(dtype=np.bool_)
-    traj_mean, traj_std = _fit_observed_stats(traj_mat[tr_visit])
-    panel_mean, panel_std = _fit_observed_stats(panel_mat[idx_splits[0]])
+    idx_sp = _stratified_split_indices(ev, config.train_frac, config.val_frac, config.seed)
+    sp_pids = tuple(tuple(pids[i] for i in idx) for idx in idx_sp)
+    t_mat = _apply_log1p(pre, raw.traj_cols, raw.log_transform_traj_cols)
+    p_mat = _apply_log1p(enroll, raw.panel_cols, raw.log_transform_panel_cols)
+    tr_v = pre["patient_id"].isin(set(sp_pids[0])).to_numpy(np.bool_)
+    t_mean, t_std = _fit_observed_stats(t_mat[tr_v])
+    p_mean, p_std = _fit_observed_stats(p_mat[idx_sp[0]])
 
-    row_pids, row_times = pre_df["patient_id"].to_numpy(), pre_df["visit_time"].to_numpy(np.float64)
-    d_traj, t_land = traj_mat.shape[1], float(config.landmark_time)
-    built: list[LandmarkedSplit] = []
-    for sp_pids in split_pids:
-        n_sp, lmap = len(sp_pids), {pid: i for i, pid in enumerate(sp_pids)}
-        keep = np.fromiter((p in lmap for p in row_pids), dtype=np.bool_, count=len(row_pids))
-        p_idx = np.fromiter(
-            (lmap[str(p)] for p in row_pids[keep]), dtype=np.int64, count=int(keep.sum())
+    r_pids, r_times = pre["patient_id"].to_numpy(), pre["visit_time"].to_numpy(np.float64)
+    t_land = float(config.landmark_time)
+    built = [
+        _pack_split(
+            sp,
+            r_pids,
+            r_times,
+            t_mat,
+            t_mean,
+            t_std,
+            p_mat,
+            p_mean,
+            p_std,
+            fu,
+            ev,
+            pid_to_pos,
+            t_land,
+            raw.ground_truth_by_id,
         )
-        counts = np.bincount(p_idx, minlength=n_sp)
-        l_max = int(counts.max())
-        offsets = np.zeros(n_sp, dtype=np.int64)
-        if n_sp > 1:
-            offsets[1:] = np.cumsum(counts[:-1])
-        order = np.argsort(p_idx, kind="mergesort")
-        p_idx = p_idx[order]
-        s_times, s_traj = row_times[keep][order], traj_mat[keep][order]
-        step = np.arange(len(p_idx), dtype=np.int64) - offsets[p_idx]
-
-        t_vals = np.zeros((n_sp, l_max, d_traj), dtype=np.float32)
-        t_mask = np.zeros((n_sp, l_max, d_traj), dtype=np.float32)
-        v_times = np.zeros((n_sp, l_max), dtype=np.float32)
-        v_deltas = np.zeros((n_sp, l_max), dtype=np.float32)
-        v_lags = np.zeros((n_sp, l_max), dtype=np.float32)
-        v_mask = np.zeros((n_sp, l_max), dtype=np.bool_)
-        obs_t = ~np.isnan(s_traj)
-        t_vals[p_idx, step, :] = np.where(obs_t, (s_traj - traj_mean) / traj_std, 0.0).astype(
-            np.float32
-        )
-        t_mask[p_idx, step, :] = obs_t.astype(np.float32)
-        v_times[p_idx, step], v_lags[p_idx, step] = (
-            s_times.astype(np.float32),
-            (t_land - s_times).astype(np.float32),
-        )
-        v_mask[p_idx, step] = True
-        if l_max > 1:
-            v_deltas[:, 1:] = np.where(
-                v_mask[:, 1:], np.maximum(v_times[:, 1:] - v_times[:, :-1], 0.0), 0.0
-            )
-
-        g_idx = np.fromiter((pid_to_pos[p] for p in sp_pids), dtype=np.int64, count=n_sp)
-        raw_p = panel_mat[g_idx]
-        obs_p = ~np.isnan(raw_p)
-        p_vals = np.where(obs_p, (raw_p - panel_mean) / panel_std, 0.0).astype(np.float32)
-        gt: GroundTruthSubspaces | None = None
-        if raw.ground_truth_by_id is not None:
-            gt = GroundTruthSubspaces(
-                u_shared=np.vstack([raw.ground_truth_by_id[p][0] for p in sp_pids]).astype(
-                    np.float32
-                ),
-                u_traj=np.vstack([raw.ground_truth_by_id[p][1] for p in sp_pids]).astype(
-                    np.float32
-                ),
-                u_mol=np.vstack([raw.ground_truth_by_id[p][2] for p in sp_pids]).astype(np.float32),
-            )
-        built.append(
-            LandmarkedSplit(
-                ssl=SSLPretrainSplit(
-                    sp_pids,
-                    t_land,
-                    t_vals,
-                    t_mask,
-                    v_times,
-                    v_deltas,
-                    v_lags,
-                    v_mask,
-                    p_vals,
-                    obs_p.astype(np.float32),
-                    obs_p.any(axis=1),
-                ),
-                residual_duration=(followup_time[g_idx] - t_land).astype(np.float64),
-                event=event[g_idx].astype(np.int64),
-                ground_truth=gt,
-            )
-        )
-
+        for sp in sp_pids
+    ]
     pnames = raw.panel_feature_names if raw.panel_feature_names is not None else raw.panel_cols
     return LandmarkedCohortSplits(
         raw.cohort_name,
@@ -313,10 +326,10 @@ def build_landmarked_splits(
         built[0],
         built[1],
         built[2],
-        traj_mean,
-        traj_std,
-        panel_mean,
-        panel_std,
+        t_mean,
+        t_std,
+        p_mean,
+        p_std,
     )
 
 
@@ -332,18 +345,15 @@ def generate_raw_synthetic_subspace_cohort(
     if n_patients < 100 or d_traj < 4 or d_mol < 8:
         raise ValueError("Require n_patients >= 100, d_traj >= 4, and d_mol >= 8.")
 
-    rng = np.random.default_rng(seed)
-    k_sub = 4
-    u_s, u_t, u_m = (rng.normal(0.0, 1.0, (n_patients, k_sub)) for _ in range(3))
-    half_t, half_m = d_traj // 2, d_mol // 2
-    w_ts, w_tt = np.zeros((k_sub, d_traj)), np.zeros((k_sub, d_traj))
-    w_ts[:, :half_t] = 1.45 * np.linalg.qr(rng.normal(0.0, 1.0, (half_t, k_sub)))[0].T
-    w_tt[:, half_t:] = 1.45 * np.linalg.qr(rng.normal(0.0, 1.0, (d_traj - half_t, k_sub)))[0].T
-    w_ms, w_mm = np.zeros((k_sub, d_mol)), np.zeros((k_sub, d_mol))
-    w_ms[:, :half_m] = (rng.random((k_sub, half_m)) < 0.30) * rng.normal(0.0, 1.15, (k_sub, half_m))
-    w_mm[:, half_m:] = (rng.random((k_sub, d_mol - half_m)) < 0.30) * rng.normal(
-        0.0, 1.15, (k_sub, d_mol - half_m)
-    )
+    rng, k = np.random.default_rng(seed), 4
+    u_s, u_t, u_m = (rng.normal(0.0, 1.0, (n_patients, k)) for _ in range(3))
+    ht, hm = d_traj // 2, d_mol // 2
+    w_ts, w_tt = np.zeros((k, d_traj)), np.zeros((k, d_traj))
+    w_ts[:, :ht] = 1.45 * np.linalg.qr(rng.normal(0.0, 1.0, (ht, k)))[0].T
+    w_tt[:, ht:] = 1.45 * np.linalg.qr(rng.normal(0.0, 1.0, (d_traj - ht, k)))[0].T
+    w_ms, w_mm = np.zeros((k, d_mol)), np.zeros((k, d_mol))
+    w_ms[:, :hm] = (rng.random((k, hm)) < 0.30) * rng.normal(0.0, 1.15, (k, hm))
+    w_mm[:, hm:] = (rng.random((k, d_mol - hm)) < 0.30) * rng.normal(0.0, 1.15, (k, d_mol - hm))
 
     eta = (
         u_s @ np.array([0.65, -0.55, 0.50, -0.45])
@@ -351,35 +361,25 @@ def generate_raw_synthetic_subspace_cohort(
         + u_m @ np.array([0.40, -0.35, 0.30, -0.25])
     )
     pre_drop = rng.random(n_patients) < 0.12
-    weibull_res = (
-        -np.log(np.clip(rng.random(n_patients), 1e-6, 1.0 - 1e-6)) / (0.065 * np.exp(eta))
-    ) ** (1.0 / 1.5)
-    censor_res = rng.uniform(2.5, 9.5, n_patients)
-    followup_time = np.where(
+    weib = (-np.log(np.clip(rng.random(n_patients), 1e-6, 1.0 - 1e-6)) / (0.065 * np.exp(eta))) ** (
+        1.0 / 1.5
+    )
+    cens = rng.uniform(2.5, 9.5, n_patients)
+    fu = np.where(
         pre_drop,
         rng.uniform(0.1, landmark_time * 0.95, n_patients),
-        landmark_time + np.maximum(np.minimum(weibull_res, censor_res), 0.05),
+        landmark_time + np.maximum(np.minimum(weib, cens), 0.05),
     )
-    event = np.where(
-        pre_drop, rng.integers(0, 2, n_patients), (weibull_res <= censor_res).astype(np.int64)
-    )
+    ev = np.where(pre_drop, rng.integers(0, 2, n_patients), (weib <= cens).astype(np.int64))
 
-    panel_base = u_s @ w_ms + u_m @ w_mm + rng.normal(0.0, 0.35, (n_patients, d_mol))
-    panel_base[rng.random(n_patients) < panel_missing_rate, :] = np.nan
-    panel_base[rng.random((n_patients, d_mol)) < 0.03] = np.nan
+    p_base = u_s @ w_ms + u_m @ w_mm + rng.normal(0.0, 0.35, (n_patients, d_mol))
+    p_base[rng.random(n_patients) < panel_missing_rate, :] = np.nan
+    p_base[rng.random((n_patients, d_mol)) < 0.03] = np.nan
 
     n_pre = np.clip(1 + rng.poisson(np.exp(0.75 + 0.35 * u_s[:, 0])), 1, 11)
-    pids = [f"syn_{idx:04d}" for idx in range(n_patients)]
+    pids = [f"syn_{i:04d}" for i in range(n_patients)]
     base_s, base_t = u_s @ w_ts, u_t @ w_tt
-    rows_pid, rows_fu, rows_ev, rows_vt, enroll_rows, traj_blocks, cursor = (
-        [],
-        [],
-        [],
-        [],
-        [],
-        [],
-        0,
-    )
+    r_pid, r_fu, r_ev, r_vt, enroll_idx, blocks, cur = [], [], [], [], [], [], 0
     for i in range(n_patients):
         t_i = np.concatenate(
             [
@@ -388,51 +388,52 @@ def generate_raw_synthetic_subspace_cohort(
                 [landmark_time + 0.35, landmark_time + 1.10],
             ]
         )
-        n_v = len(t_i)
+        nv = len(t_i)
         tau = t_i[:, None] / landmark_time
         obs = (
             (0.85 + 0.20 * tau) * base_s[i : i + 1]
             + (0.35 + 1.15 * tau) * base_t[i : i + 1]
             + (t_i > landmark_time)[:, None] * (1.5 * eta[i])
-            + rng.normal(0.0, 0.25, (n_v, d_traj))
+            + rng.normal(0.0, 0.25, (nv, d_traj))
         )
-        mcar = rng.random((n_v, d_traj)) < 0.05
+        mcar = rng.random((nv, d_traj)) < 0.05
         mcar[0, :] = False
         obs[mcar] = np.nan
-        enroll_rows.append(cursor)
-        cursor += n_v
-        rows_pid.extend([pids[i]] * n_v)
-        rows_fu.extend([float(followup_time[i])] * n_v)
-        rows_ev.extend([int(event[i])] * n_v)
-        rows_vt.extend(t_i.tolist())
-        traj_blocks.append(obs)
+        enroll_idx.append(cur)
+        cur += nv
+        r_pid.extend([pids[i]] * nv)
+        r_fu.extend([float(fu[i])] * nv)
+        r_ev.extend([int(ev[i])] * nv)
+        r_vt.extend(t_i.tolist())
+        blocks.append(obs)
 
-    traj_cols = tuple(f"traj_{j}" for j in range(d_traj))
-    panel_cols = tuple(f"mol_{j}" for j in range(d_mol))
-    panel_all = np.full((cursor, d_mol), np.nan, dtype=np.float64)
-    panel_all[np.asarray(enroll_rows, dtype=np.int64)] = panel_base
+    t_cols, p_cols = (
+        tuple(f"traj_{j}" for j in range(d_traj)),
+        tuple(f"mol_{j}" for j in range(d_mol)),
+    )
+    p_all = np.full((cur, d_mol), np.nan, dtype=np.float64)
+    p_all[np.asarray(enroll_idx, dtype=np.int64)] = p_base
+    meta = pd.DataFrame(
+        {
+            "patient_id": r_pid,
+            "followup_time": np.asarray(r_fu, np.float64),
+            "event": np.asarray(r_ev, np.int64),
+            "visit_time": np.asarray(r_vt, np.float64),
+        }
+    )
     df = pd.concat(
         [
-            pd.DataFrame(
-                {
-                    "patient_id": rows_pid,
-                    "followup_time": np.asarray(rows_fu, dtype=np.float64),
-                    "event": np.asarray(rows_ev, dtype=np.int64),
-                    "visit_time": np.asarray(rows_vt, dtype=np.float64),
-                }
-            ),
-            pd.DataFrame(np.vstack(traj_blocks), columns=list(traj_cols)),
-            pd.DataFrame(panel_all, columns=list(panel_cols)),
+            meta,
+            pd.DataFrame(np.vstack(blocks), columns=list(t_cols)),
+            pd.DataFrame(p_all, columns=list(p_cols)),
         ],
         axis=1,
     )
-    u_s32, u_t32, u_m32 = u_s.astype(np.float32), u_t.astype(np.float32), u_m.astype(np.float32)
-    gt_by_id: dict[str, OracleTuple] = {
-        pids[i]: (u_s32[i], u_t32[i], u_m32[i]) for i in range(n_patients)
-    }
+    us32, ut32, um32 = u_s.astype(np.float32), u_t.astype(np.float32), u_m.astype(np.float32)
+    gt = {pids[i]: (us32[i], ut32[i], um32[i]) for i in range(n_patients)}
     name = f"synthetic_subspace_n{n_patients}_dt{d_traj}_dm{d_mol}_seed{seed}"
     return RawLongitudinalCohort(
-        name, _hash_dataframe(name, df), df, traj_cols, panel_cols, ground_truth_by_id=gt_by_id
+        name, _hash_dataframe(name, df), df, t_cols, p_cols, ground_truth_by_id=gt
     )
 
 
@@ -465,11 +466,9 @@ def load_raw_pbc2_cohort(
     path = parquet_path if parquet_path is not None else DEFAULT_PBC2_PARQUET
     if not path.exists():
         raise FileNotFoundError(f"PBC2 cohort parquet not found at {path}")
-    actual_sha256 = _sha256_file(path)
-    if expected_sha256 is not None and actual_sha256 != expected_sha256:
-        raise ValueError(
-            f"PBC2 parquet SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256}"
-        )
+    sha = _sha256_file(path)
+    if expected_sha256 is not None and sha != expected_sha256:
+        raise ValueError(f"PBC2 parquet SHA-256 mismatch: expected {expected_sha256}, got {sha}")
     df = pq.read_table(path).to_pandas()
     missing = {
         "patient_id",
@@ -483,7 +482,7 @@ def load_raw_pbc2_cohort(
         raise ValueError(f"PBC2 parquet missing required columns: {sorted(missing)}")
     return RawLongitudinalCohort(
         "pbc2_longitudinal",
-        actual_sha256,
+        sha,
         df,
         PBC2_TRAJ_COLS,
         PBC2_RAW_PANEL_COLS,
@@ -505,7 +504,9 @@ def load_pbc2_cohort(
 ) -> LandmarkedCohortSplits:
     """Load, verify, landmark, and split the Mayo Clinic PBC2 longitudinal cohort."""
     raw = load_raw_pbc2_cohort(parquet_path=parquet_path, expected_sha256=expected_sha256)
-    cfg = LandmarkCohortConfig(
-        landmark_time=landmark_time, train_frac=train_frac, val_frac=val_frac, seed=seed
+    return build_landmarked_splits(
+        raw,
+        LandmarkCohortConfig(
+            landmark_time=landmark_time, train_frac=train_frac, val_frac=val_frac, seed=seed
+        ),
     )
-    return build_landmarked_splits(raw, cfg)

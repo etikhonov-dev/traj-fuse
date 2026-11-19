@@ -70,8 +70,8 @@ class FrozenSSLCheckpoint:
 
     def parameter_sha256(self) -> dict[str, str]:
         return {
-            name: hashlib.sha256(p.detach().cpu().numpy().tobytes()).hexdigest()
-            for name, p in self.model.named_parameters()
+            n: hashlib.sha256(p.detach().cpu().numpy().tobytes()).hexdigest()
+            for n, p in self.model.named_parameters()
         }
 
     def encode(
@@ -82,33 +82,34 @@ class FrozenSSLCheckpoint:
         self.model.eval()
         n = len(ssl_split.patient_ids)
         drop_arr = (
-            np.full(n, force_drop_panel, dtype=np.bool_)
+            np.full(n, force_drop_panel, np.bool_)
             if isinstance(force_drop_panel, bool)
-            else np.asarray(force_drop_panel, dtype=np.bool_)
+            else np.asarray(force_drop_panel, np.bool_)
         )
         if drop_arr.shape != (n,):
             raise ValueError(f"force_drop_panel shape {drop_arr.shape} != ({n},)")
         active = ssl_split.panel_available & (~drop_arr)
 
+        s = ssl_split
         with torch.inference_mode():
             out = self.model(
-                torch.from_numpy(ssl_split.traj_values),
-                torch.from_numpy(ssl_split.traj_obs_mask),
-                torch.from_numpy(ssl_split.visit_deltas),
-                torch.from_numpy(ssl_split.landmark_lags),
-                torch.from_numpy(ssl_split.visit_mask),
-                ssl_split.landmark_time,
-                torch.from_numpy(ssl_split.panel_values),
-                torch.from_numpy(ssl_split.panel_obs_mask),
+                torch.from_numpy(s.traj_values),
+                torch.from_numpy(s.traj_obs_mask),
+                torch.from_numpy(s.visit_deltas),
+                torch.from_numpy(s.landmark_lags),
+                torch.from_numpy(s.visit_mask),
+                s.landmark_time,
+                torch.from_numpy(s.panel_values),
+                torch.from_numpy(s.panel_obs_mask),
                 torch.from_numpy(active),
             )
         return PatientEmbeddings(
-            patient_ids=ssl_split.patient_ids,
-            z_shared=out.z_shared.cpu().numpy().astype(np.float32),
-            z_priv_traj=out.z_traj_priv.cpu().numpy().astype(np.float32),
-            z_priv_mol=out.z_mol_priv_tilde.cpu().numpy().astype(np.float32),
-            z_fused=out.z_fused.cpu().numpy().astype(np.float32),
-            panel_active=active.copy(),
+            s.patient_ids,
+            out.z_shared.cpu().numpy().astype(np.float32),
+            out.z_traj_priv.cpu().numpy().astype(np.float32),
+            out.z_mol_priv_tilde.cpu().numpy().astype(np.float32),
+            out.z_fused.cpu().numpy().astype(np.float32),
+            active.copy(),
         )
 
 
@@ -117,8 +118,8 @@ def pretrain_ssl(
     config: SharedPrivateConfig,
     *,
     epochs: int = 30,
-    batch_size: int = 256,
-    lr: float = 1e-3,
+    batch_size: int = 128,
+    lr: float = 2e-3,
     weight_decay: float = 1e-4,
     seed: int = 42,
 ) -> FrozenSSLCheckpoint:
@@ -133,15 +134,20 @@ def pretrain_ssl(
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
     gen = torch.Generator().manual_seed(seed)
 
-    t_val = torch.from_numpy(ssl_split.traj_values)
-    t_mask = torch.from_numpy(ssl_split.traj_obs_mask)
-    v_del = torch.from_numpy(ssl_split.visit_deltas)
-    l_lag = torch.from_numpy(ssl_split.landmark_lags)
-    v_mask = torch.from_numpy(ssl_split.visit_mask)
-    p_val = torch.from_numpy(ssl_split.panel_values)
-    p_mask = torch.from_numpy(ssl_split.panel_obs_mask)
-    p_avail = torch.from_numpy(ssl_split.panel_available)
-    n_total = len(ssl_split.patient_ids)
+    s = ssl_split
+    tv, tm, vd, ll, vm = (
+        torch.from_numpy(s.traj_values),
+        torch.from_numpy(s.traj_obs_mask),
+        torch.from_numpy(s.visit_deltas),
+        torch.from_numpy(s.landmark_lags),
+        torch.from_numpy(s.visit_mask),
+    )
+    pv, pm, pa = (
+        torch.from_numpy(s.panel_values),
+        torch.from_numpy(s.panel_obs_mask),
+        torch.from_numpy(s.panel_available),
+    )
+    n_total = len(s.patient_ids)
     bs = min(batch_size, n_total)
 
     history: list[dict[str, float]] = []
@@ -155,15 +161,15 @@ def pretrain_ssl(
                 continue
             opt.zero_grad(set_to_none=True)
             loss, metrics = ssl_mod.forward_loss(
-                t_val[idx],
-                t_mask[idx],
-                v_del[idx],
-                l_lag[idx],
-                v_mask[idx],
-                ssl_split.landmark_time,
-                p_val[idx],
-                p_mask[idx],
-                p_avail[idx],
+                tv[idx],
+                tm[idx],
+                vd[idx],
+                ll[idx],
+                vm[idx],
+                s.landmark_time,
+                pv[idx],
+                pm[idx],
+                pa[idx],
                 generator=gen,
             )
             torch.autograd.backward(loss)
