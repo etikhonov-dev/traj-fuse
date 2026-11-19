@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import time
 
+import numpy as np
 import pytest
 import torch
 
+from traj_fuse.data import make_synthetic_subspace_cohort
 from traj_fuse.encoders import IrregularTrajectoryEncoder, MolecularEncoder, Time2Vec
+from traj_fuse.model import SharedPrivateConfig, SharedPrivateFuse, SSLPretrainModule
+from traj_fuse.train import pretrain_ssl
 
 
 def _make_traj_inputs(
@@ -86,7 +90,6 @@ def test_single_and_multi_visit_finite_gradients_and_latency() -> None:
     p_val = torch.randn(16, 256)
     p_mask = (torch.rand(16, 256) > 0.2).float()
 
-    # Warm up CPU dispatch before timing
     zs_t, zp_t = enc(t_val, t_mask, v_del, l_lag, v_mask, landmark_time=2.0)
     zs_m, zp_m = mol_enc(p_val, p_mask)
     (
@@ -110,25 +113,25 @@ def test_single_and_multi_visit_finite_gradients_and_latency() -> None:
     for p in list(enc.parameters()) + list(mol_enc.parameters()):
         assert p.grad is not None
         assert torch.isfinite(p.grad).all()
-    assert elapsed_ms < 25.0  # warm batch latency check (< 5ms typical)
+    assert elapsed_ms < 25.0
 
 
 def test_trajectory_encoder_preserves_radial_severity() -> None:
-    torch.manual_seed(19)
-    enc = IrregularTrajectoryEncoder(
-        d_traj=8, d_model=64, n_heads=4, n_layers=2, d_shared=4, d_priv=4
-    )
-    enc.eval()
-    t_val, t_mask, v_del, l_lag, v_mask = _make_traj_inputs(
-        batch_size=1, l_max=6, single_visit_rows=()
-    )
-    v_mask[0, :4] = True
-    t_mask[0, :4, :] = 1.0
-    base = torch.ones_like(t_val) * 0.5
+    splits = make_synthetic_subspace_cohort(n_patients=160, d_traj=8, d_mol=16, seed=19)
+    cfg = SharedPrivateConfig(d_traj=8, d_mol=16, d_shared=4, d_priv=4, p_drop=0.30)
+    ckpt = pretrain_ssl(splits.train.to_ssl_split(), cfg, epochs=12, batch_size=64, seed=19)
+    enc = ckpt.model.traj_enc
+    ssl = splits.test.to_ssl_split()
+    t_mask = torch.from_numpy(ssl.traj_obs_mask[:1]).clone()
+    v_del = torch.from_numpy(ssl.visit_deltas[:1])
+    l_lag = torch.from_numpy(ssl.landmark_lags[:1])
+    v_mask = torch.from_numpy(ssl.visit_mask[:1])
+    base = torch.ones((1, t_mask.shape[1], 8), dtype=torch.float32) * 0.5
     scales = (0.5, 1.0, 2.0, 4.0)
     with torch.no_grad():
-        unit_dir, _ = enc(base, t_mask, v_del, l_lag, v_mask, landmark_time=2.0)
-        unit_dir = unit_dir / unit_dir.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        z_low, _ = enc(base * scales[0], t_mask, v_del, l_lag, v_mask, landmark_time=2.0)
+        z_high, _ = enc(base * scales[-1], t_mask, v_del, l_lag, v_mask, landmark_time=2.0)
+        unit_dir = (z_high - z_low) / (z_high - z_low).norm(dim=-1, keepdim=True).clamp_min(1e-8)
         projs = []
         for s in scales:
             zs, _ = enc(base * s, t_mask, v_del, l_lag, v_mask, landmark_time=2.0)
@@ -136,3 +139,66 @@ def test_trajectory_encoder_preserves_radial_severity() -> None:
 
     assert projs[0] < projs[1] < projs[2] < projs[3]
     assert pytest.approx(projs[3], rel=0.05) != projs[0]
+
+
+def test_pdrop_activates_missing_token_and_fusion_gradients() -> None:
+    torch.set_num_threads(1)
+    t_val, t_mask, v_del, l_lag, v_mask = _make_traj_inputs(batch_size=16, l_max=8, seed=3)
+    p_val = torch.randn(16, 24)
+    p_mask = torch.ones(16, 24)
+    p_avail = torch.ones(16, dtype=torch.bool)  # fully paired batch
+
+    for p_drop, expect_nonzero_b in ((0.30, True), (0.0, False)):
+        torch.manual_seed(5)
+        cfg = SharedPrivateConfig(d_traj=8, d_mol=24, d_shared=4, d_priv=4, p_drop=p_drop)
+        ssl_mod = SSLPretrainModule(cfg)
+        gen = torch.Generator().manual_seed(17)
+        loss, _ = ssl_mod.forward_loss(
+            t_val, t_mask, v_del, l_lag, v_mask, 2.0, p_val, p_mask, p_avail, generator=gen
+        )
+        loss.backward()
+
+        assert ssl_mod.fuse.b_miss_mol.grad is not None
+        b_grad_norm = float(ssl_mod.fuse.b_miss_mol.grad.abs().sum().item())
+        last_fuse = list(ssl_mod.fuse.mlp_fuse.modules())[-1]
+        assert isinstance(last_fuse, torch.nn.Linear)
+        assert last_fuse.weight.grad is not None
+        fuse_grad_norm = float(last_fuse.weight.grad.abs().sum().item())
+
+        if expect_nonzero_b:
+            assert b_grad_norm > 0.0
+            assert fuse_grad_norm > 0.0
+        else:
+            assert b_grad_norm == 0.0
+
+
+@pytest.mark.parametrize("n_paired", [0, 2, 5])
+def test_paired_subset_edge_cases_finite(n_paired: int) -> None:
+    batch_size = 8
+    t_val, t_mask, v_del, l_lag, v_mask = _make_traj_inputs(batch_size=batch_size, l_max=6, seed=9)
+    p_val = torch.randn(batch_size, 16)
+    p_mask = torch.zeros(batch_size, 16)
+    p_avail = torch.zeros(batch_size, dtype=torch.bool)
+    if n_paired > 0:
+        p_avail[:n_paired] = True
+        p_mask[:n_paired] = 1.0
+
+    cfg = SharedPrivateConfig(d_traj=8, d_mol=16, d_shared=4, d_priv=4, p_drop=0.30)
+    ssl_mod = SSLPretrainModule(cfg)
+    gen = torch.Generator().manual_seed(42)
+    loss, metrics = ssl_mod.forward_loss(
+        t_val, t_mask, v_del, l_lag, v_mask, 2.0, p_val, p_mask, p_avail, generator=gen
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(np.isfinite(v) for v in metrics.values())
+
+
+def test_ssl_pretraining_prevents_collapse_on_heldout_eval() -> None:
+    splits = make_synthetic_subspace_cohort(n_patients=220, d_traj=8, d_mol=32, seed=21)
+    cfg = SharedPrivateConfig(d_traj=8, d_mol=32, d_shared=4, d_priv=4, p_drop=0.30)
+    ckpt = pretrain_ssl(splits.train.to_ssl_split(), cfg, epochs=15, batch_size=64, seed=21)
+    emb = ckpt.encode(splits.test.to_ssl_split())
+    coord_std = np.std(emb.z_fused, axis=0)
+    assert float(coord_std.min()) > 0.45
+    assert isinstance(ckpt.model, SharedPrivateFuse)
