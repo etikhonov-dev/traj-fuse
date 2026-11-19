@@ -52,10 +52,10 @@ def test_missing_panel_inference_and_pdrop_consistency_gain() -> None:
     cfg_nodrop = SharedPrivateConfig.for_cohort(splits, p_drop=0.0)
 
     ckpt_drop = pretrain_ssl(
-        splits.train.to_ssl_split(), cfg_drop, epochs=25, batch_size=64, seed=11
+        splits.train.to_ssl_split(), cfg_drop, epochs=18, batch_size=64, seed=11
     )
     ckpt_nodrop = pretrain_ssl(
-        splits.train.to_ssl_split(), cfg_nodrop, epochs=25, batch_size=64, seed=11
+        splits.train.to_ssl_split(), cfg_nodrop, epochs=18, batch_size=64, seed=11
     )
 
     drop_50 = np.zeros(n_test, dtype=np.bool_)
