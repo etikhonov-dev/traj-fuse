@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "traj-fuse"
+version = "0.1.0"
+description = "Continuous-time longitudinal trajectory and missing-panel multimodal survival representation learning"
+requires-python = ">=3.11"
+dependencies = [
+    "matplotlib>=3.9",
+    "numpy>=2.0,<3.0",
+    "pandas>=2.2,<3.0",
+    "pyarrow>=17.0",
+    "pydantic>=2.9,<3.0",
+    "scipy>=1.14",
+    "torch>=2.4,<3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.13",
+    "pandas-stubs>=2.2",
+    "pip-audit>=2.7",
+    "pytest>=8.3",
+    "pytest-cov>=5.0",
+    "ruff>=0.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/traj_fuse"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S", "N", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+"scripts/floor_guard.py" = ["S603"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*", "scipy", "scipy.*", "matplotlib", "matplotlib.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+
+[tool.coverage.run]
+source = ["src/traj_fuse"]
+branch = false
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
