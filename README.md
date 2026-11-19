@@ -94,3 +94,9 @@ docker build -t traj-fuse .
 docker run --rm -v "$(pwd)/artifacts:/out" traj-fuse \
   run --cohort pbc2 --preset full --out /out/pbc2
 ```
+
+---
+
+## License
+
+Source code (`src/`, `tests/`, `scripts/`) is licensed under the [MIT License](LICENSE). The bundled Mayo Clinic `PBC2` (`pbcseq`) benchmark artifacts (`data/raw/pbcseq.csv`, `data/pbc2_longitudinal.parquet`) are derived from CRAN `survival::pbcseq` / `JM::pbc2` and remain under their upstream **GPL (>= 2)** license (see [`data/DATASETS.md`](data/DATASETS.md)).

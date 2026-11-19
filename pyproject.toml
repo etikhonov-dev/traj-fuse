@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "traj-fuse"
 version = "0.1.0"
 description = "Continuous-time longitudinal trajectory and missing-panel multimodal survival representation learning"
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
     "matplotlib>=3.9",
